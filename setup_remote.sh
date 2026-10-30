@@ -3,10 +3,12 @@
 # Usage: ./setup_remote.sh [--nsight]
 #   --nsight  also install Nsight Compute (ncu) and Nsight Systems (nsys) for profiling
 set -euo pipefail
+trap 'echo "setup_remote.sh: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 cd "$(dirname "$0")"
 
 # Reference binaries (*_ref_x86) need glibc >= 2.38, i.e. Ubuntu 24.04+.
-glibc=$(ldd --version | head -1 | grep -oE '[0-9]+\.[0-9]+$')
+# (getconf avoids a `ldd | head` pipeline, which can SIGPIPE and trip pipefail.)
+glibc=$(getconf GNU_LIBC_VERSION | awk '{print $2}')
 echo "arch=$(uname -m) glibc=$glibc"
 if [ "$(printf '%s\n' 2.38 "$glibc" | sort -V | head -1)" != "2.38" ]; then
     echo "ERROR: glibc $glibc < 2.38; reference binaries won't run. Relaunch with Ubuntu 24.04." >&2
