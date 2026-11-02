@@ -14,6 +14,59 @@
 
 #define THREADS_PER_BLOCK 256
 
+// One CUDA thread processes one logical scan block.  At each upsweep
+// level, the rightmost entry of the block becomes the sum of both halves.
+__global__ void upsweep_kernel(int* output, int length, int half) {
+    int logical_scan_block_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int logical_scan_block_size = 2 * half;
+    int logical_scan_block_start = logical_scan_block_id * logical_scan_block_size;
+
+    if (logical_scan_block_start + logical_scan_block_size <= length) {
+        int left_root = logical_scan_block_start + half - 1;
+        int block_root = logical_scan_block_start + logical_scan_block_size - 1;
+        output[block_root] += output[left_root];
+    }
+}
+
+// During downsweep, block_root holds the prefix before the logical block and
+// left_root still holds the total of its left half.  Distribute that prefix to
+// the two children of the block.
+__global__ void downsweep_kernel(int* output, int length, int half) {
+    int block_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int block_size = 2 * half;
+    int block_start = block_id * block_size;
+
+    if (block_start + block_size <= length) {
+        int left_root = block_start + half - 1;
+        int block_root = block_start + block_size - 1;
+
+        int left_sum = output[left_root];
+        output[left_root] = output[block_root];
+        output[block_root] += left_sum;
+    }
+}
+
+// Mark every position i whose value equals the value immediately to its
+// right.  flags[i] is therefore 1 when i should appear in the answer.
+__global__ void mark_repeats_kernel(const int* input, int length, int* flags) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index < length - 1) {
+        flags[index] = (input[index] == input[index + 1]) ? 1 : 0;
+    }
+}
+
+// flags[i] says whether i is a repeat; offsets[i] is the number of repeats
+// before i.  Thus every matching index writes to a distinct compact slot.
+__global__ void scatter_repeats_kernel(const int* flags, const int* offsets,
+                                       int length, int* output) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index < length - 1 && flags[index]) {
+        output[offsets[index]] = index;
+    }
+}
+
 
 // helper function to round an integer up to the next power of 2
 static inline int nextPow2(int n) {
@@ -44,19 +97,42 @@ static inline int nextPow2(int n) {
 // places it in result
 void exclusive_scan(int* input, int N, int* result)
 {
+    if (N <= 0) {
+        return;
+    }
 
-    // CS149 TODO:
-    //
-    // Implement your exclusive scan implementation here.  Keep in
-    // mind that although the arguments to this function are device
-    // allocated arrays, this is a function that is running in a thread
-    // on the CPU.  Your implementation will need to make multiple calls
-    // to CUDA kernel functions (that you must write) to implement the
-    // scan.
+    const int length = nextPow2(N);
 
+    // The caller may provide distinct input and output buffers.  The timing
+    // harness happens to pre-initialize result, but copying here makes this
+    // function correct for both in-place and out-of-place calls.
+    if (input != result) {
+        cudaMemcpy(result, input, N * sizeof(int), cudaMemcpyDeviceToDevice);
+    }
 
+    // The algorithm operates on a power-of-two-sized tree.  Padding with
+    // zeros preserves every prefix sum in the original logical range.
+    if (length > N) {
+        cudaMemset(result + N, 0, (length - N) * sizeof(int));
+    }
+
+    // Upsweep: compute a sum at the root of every logical block.
+    for (int half = 1; half < length; half *= 2) {
+        int operations = length / (2 * half);
+        int blocks = (operations + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        upsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, length, half);
+    }
+
+    // The root represents the prefix before the whole array, which is zero.
+    cudaMemset(result + length - 1, 0, sizeof(int));
+
+    // Downsweep: replace subtree sums with their exclusive-prefix offsets.
+    for (int half = length / 2; half >= 1; half /= 2) {
+        int operations = length / (2 * half);
+        int blocks = (operations + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        downsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, length, half);
+    }
 }
-
 
 //
 // cudaScan --
@@ -148,20 +224,41 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 //
 // Returns the total number of pairs found
 int find_repeats(int* device_input, int length, int* device_output) {
+    if (length <= 1) {
+        return 0;
+    }
 
-    // CS149 TODO:
-    //
-    // Implement this function. You will probably want to
-    // make use of one or more calls to exclusive_scan(), as well as
-    // additional CUDA kernel launches.
-    //    
-    // Note: As in the scan code, the calling code ensures that
-    // allocated arrays are a power of 2 in size, so you can use your
-    // exclusive_scan function with them. However, your implementation
-    // must ensure that the results of find_repeats are correct given
-    // the actual array length.
+    const int padded_length = nextPow2(length);
+    const int threads = THREADS_PER_BLOCK;
+    const int blocks = (length - 1 + threads - 1) / threads;
 
-    return 0; 
+    int* device_flags;
+    int* device_offsets;
+    cudaMalloc((void**)&device_flags, padded_length * sizeof(int));
+    cudaMalloc((void**)&device_offsets, padded_length * sizeof(int));
+
+    // Padding and the final element must contribute no repeat.  This also
+    // prevents a padded value from being mistaken for a neighbor of the last
+    // logical input element.
+    cudaMemset(device_flags, 0, padded_length * sizeof(int));
+    mark_repeats_kernel<<<blocks, threads>>>(device_input, length, device_flags);
+
+    // Convert flags such as [0, 1, 0, 1] into write positions [0, 0, 1, 1].
+    // Scan the padded range because exclusive_scan operates on a power of 2.
+    exclusive_scan(device_flags, padded_length, device_offsets);
+    scatter_repeats_kernel<<<blocks, threads>>>(device_flags, device_offsets,
+                                                 length, device_output);
+
+    // flags[length - 1] is zero, so its exclusive-scan value equals the total
+    // number of valid repeat pairs.  Copying this one integer is necessary:
+    // the C++ caller needs the count as a host-side return value.
+    int repeat_count;
+    cudaMemcpy(&repeat_count, device_offsets + length - 1, sizeof(int),
+               cudaMemcpyDeviceToHost);
+
+    cudaFree(device_flags);
+    cudaFree(device_offsets);
+    return repeat_count;
 }
 
 

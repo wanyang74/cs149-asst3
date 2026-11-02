@@ -55,6 +55,11 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 // file simpler and to seperate code that should not be modified
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
+#include "circleBoxTest.cu_inl"
+
+#define RENDER_TILE_WIDTH 16
+#define RENDER_TILE_HEIGHT 16
+#define CIRCLES_PER_RENDER_BATCH (RENDER_TILE_WIDTH * RENDER_TILE_HEIGHT)
 
 
 // kernelClearImageSnowflake -- (CUDA device code)
@@ -427,6 +432,227 @@ __global__ void kernelRenderCircles() {
     }
 }
 
+// Correctness-first renderer: one CUDA thread owns one output pixel.  The
+// thread visits circles in input order, so the read-modify-write sequence for
+// that pixel is serial and has exactly the same ordering as the CPU renderer.
+// Different threads write different pixels, so no atomic operation is needed.
+__global__ void kernelRenderPixels() {
+
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+
+    const int imageWidth = cuConstRendererParams.imageWidth;
+    const int imageHeight = cuConstRendererParams.imageHeight;
+
+    if (pixelX >= imageWidth || pixelY >= imageHeight) {
+        return;
+    }
+
+    const int pixelOffset = 4 * (pixelY * imageWidth + pixelX);
+    const float2 pixelCenter = make_float2(
+        (static_cast<float>(pixelX) + 0.5f) / imageWidth,
+        (static_cast<float>(pixelY) + 0.5f) / imageHeight);
+
+    // Keep the running pixel color in registers.  It is written to global
+    // memory only once, after all circles have been composited.
+    float4 pixelColor = *(float4*)(&cuConstRendererParams.imageData[pixelOffset]);
+    const bool isSnowflake =
+        cuConstRendererParams.sceneName == SNOWFLAKES ||
+        cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME;
+
+    for (int circleIndex = 0;
+         circleIndex < cuConstRendererParams.numCircles;
+         ++circleIndex) {
+
+        const int index3 = 3 * circleIndex;
+        const float3 circlePosition =
+            *(float3*)(&cuConstRendererParams.position[index3]);
+        const float circleRadius = cuConstRendererParams.radius[circleIndex];
+
+        const float diffX = circlePosition.x - pixelCenter.x;
+        const float diffY = circlePosition.y - pixelCenter.y;
+        const float pixelDist = diffX * diffX + diffY * diffY;
+
+        if (pixelDist > circleRadius * circleRadius) {
+            continue;
+        }
+
+        float3 rgb;
+        float alpha;
+        if (isSnowflake) {
+            const float kCircleMaxAlpha = .5f;
+            const float falloffScale = 4.f;
+
+            const float normPixelDist = sqrt(pixelDist) / circleRadius;
+            rgb = lookupColor(normPixelDist);
+
+            float maxAlpha = .6f + .4f * (1.f - circlePosition.z);
+            maxAlpha = kCircleMaxAlpha *
+                fmaxf(fminf(maxAlpha, 1.f), 0.f);
+            alpha = maxAlpha * exp(-falloffScale * normPixelDist * normPixelDist);
+        } else {
+            rgb = *(float3*)(&cuConstRendererParams.color[index3]);
+            alpha = .5f;
+        }
+
+        const float oneMinusAlpha = 1.f - alpha;
+        pixelColor.x = alpha * rgb.x + oneMinusAlpha * pixelColor.x;
+        pixelColor.y = alpha * rgb.y + oneMinusAlpha * pixelColor.y;
+        pixelColor.z = alpha * rgb.z + oneMinusAlpha * pixelColor.z;
+        pixelColor.w = alpha + pixelColor.w;
+    }
+
+    *(float4*)(&cuConstRendererParams.imageData[pixelOffset]) = pixelColor;
+}
+
+// Tiled version of the correctness-first renderer.  A CUDA block owns a
+// 16x16 pixel tile.  Circles are loaded in batches into shared memory, then
+// rejected once per tile when they cannot affect any pixel in that tile.
+// Every pixel still composites circles in increasing input-index order.
+__global__ void kernelRenderPixelsTiled() {
+
+    __shared__ float sharedCircleX[CIRCLES_PER_RENDER_BATCH];
+    __shared__ float sharedCircleY[CIRCLES_PER_RENDER_BATCH];
+    __shared__ float sharedCircleZ[CIRCLES_PER_RENDER_BATCH];
+    __shared__ float sharedCircleRadius[CIRCLES_PER_RENDER_BATCH];
+    __shared__ float sharedColorR[CIRCLES_PER_RENDER_BATCH];
+    __shared__ float sharedColorG[CIRCLES_PER_RENDER_BATCH];
+    __shared__ float sharedColorB[CIRCLES_PER_RENDER_BATCH];
+    __shared__ int sharedTouchesTile[CIRCLES_PER_RENDER_BATCH];
+
+    const int localThreadIndex =
+        threadIdx.y * RENDER_TILE_WIDTH + threadIdx.x;
+    const int tileStartX = blockIdx.x * RENDER_TILE_WIDTH;
+    const int tileStartY = blockIdx.y * RENDER_TILE_HEIGHT;
+    const int pixelX = tileStartX + threadIdx.x;
+    const int pixelY = tileStartY + threadIdx.y;
+
+    const int imageWidth = cuConstRendererParams.imageWidth;
+    const int imageHeight = cuConstRendererParams.imageHeight;
+    const bool pixelIsInImage = pixelX < imageWidth && pixelY < imageHeight;
+
+    const int tileEndX = (tileStartX + RENDER_TILE_WIDTH < imageWidth)
+        ? tileStartX + RENDER_TILE_WIDTH : imageWidth;
+    const int tileEndY = (tileStartY + RENDER_TILE_HEIGHT < imageHeight)
+        ? tileStartY + RENDER_TILE_HEIGHT : imageHeight;
+    const float tileLeft = static_cast<float>(tileStartX) / imageWidth;
+    const float tileRight = static_cast<float>(tileEndX) / imageWidth;
+    const float tileBottom = static_cast<float>(tileStartY) / imageHeight;
+    const float tileTop = static_cast<float>(tileEndY) / imageHeight;
+
+    float4 pixelColor = make_float4(0.f, 0.f, 0.f, 0.f);
+    float2 pixelCenter = make_float2(0.f, 0.f);
+    int pixelOffset = 0;
+    if (pixelIsInImage) {
+        pixelOffset = 4 * (pixelY * imageWidth + pixelX);
+        pixelCenter = make_float2(
+            (static_cast<float>(pixelX) + 0.5f) / imageWidth,
+            (static_cast<float>(pixelY) + 0.5f) / imageHeight);
+        pixelColor = *(float4*)(&cuConstRendererParams.imageData[pixelOffset]);
+    }
+
+    const bool isSnowflake =
+        cuConstRendererParams.sceneName == SNOWFLAKES ||
+        cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME;
+
+    for (int batchStart = 0;
+         batchStart < cuConstRendererParams.numCircles;
+         batchStart += CIRCLES_PER_RENDER_BATCH) {
+
+        const int circlesThisBatch =
+            ((cuConstRendererParams.numCircles - batchStart) < CIRCLES_PER_RENDER_BATCH)
+            ? (cuConstRendererParams.numCircles - batchStart)
+            : CIRCLES_PER_RENDER_BATCH;
+
+        if (localThreadIndex < circlesThisBatch) {
+            const int circleIndex = batchStart + localThreadIndex;
+            const int index3 = 3 * circleIndex;
+            const float3 position =
+                *(float3*)(&cuConstRendererParams.position[index3]);
+
+            sharedCircleX[localThreadIndex] = position.x;
+            sharedCircleY[localThreadIndex] = position.y;
+            sharedCircleZ[localThreadIndex] = position.z;
+            sharedCircleRadius[localThreadIndex] =
+                cuConstRendererParams.radius[circleIndex];
+            sharedColorR[localThreadIndex] =
+                cuConstRendererParams.color[index3];
+            sharedColorG[localThreadIndex] =
+                cuConstRendererParams.color[index3 + 1];
+            sharedColorB[localThreadIndex] =
+                cuConstRendererParams.color[index3 + 2];
+
+            sharedTouchesTile[localThreadIndex] = circleInBoxConservative(
+                position.x, position.y, sharedCircleRadius[localThreadIndex],
+                tileLeft, tileRight, tileTop, tileBottom);
+        } else {
+            sharedTouchesTile[localThreadIndex] = 0;
+        }
+
+        __syncthreads();
+
+        // This loop is serial per pixel, preserving the required blend order.
+        // It is parallel across pixels in the tile.
+        if (pixelIsInImage) {
+            for (int localCircleIndex = 0;
+                 localCircleIndex < circlesThisBatch;
+                 ++localCircleIndex) {
+
+                if (!sharedTouchesTile[localCircleIndex]) {
+                    continue;
+                }
+
+                const float diffX =
+                    sharedCircleX[localCircleIndex] - pixelCenter.x;
+                const float diffY =
+                    sharedCircleY[localCircleIndex] - pixelCenter.y;
+                const float pixelDist = diffX * diffX + diffY * diffY;
+                const float circleRadius =
+                    sharedCircleRadius[localCircleIndex];
+
+                if (pixelDist > circleRadius * circleRadius) {
+                    continue;
+                }
+
+                float3 rgb;
+                float alpha;
+                if (isSnowflake) {
+                    const float kCircleMaxAlpha = .5f;
+                    const float falloffScale = 4.f;
+                    const float normPixelDist = sqrt(pixelDist) / circleRadius;
+                    rgb = lookupColor(normPixelDist);
+
+                    float maxAlpha = .6f + .4f *
+                        (1.f - sharedCircleZ[localCircleIndex]);
+                    maxAlpha = kCircleMaxAlpha *
+                        fmaxf(fminf(maxAlpha, 1.f), 0.f);
+                    alpha = maxAlpha * exp(
+                        -falloffScale * normPixelDist * normPixelDist);
+                } else {
+                    rgb = make_float3(sharedColorR[localCircleIndex],
+                                      sharedColorG[localCircleIndex],
+                                      sharedColorB[localCircleIndex]);
+                    alpha = .5f;
+                }
+
+                const float oneMinusAlpha = 1.f - alpha;
+                pixelColor.x = alpha * rgb.x + oneMinusAlpha * pixelColor.x;
+                pixelColor.y = alpha * rgb.y + oneMinusAlpha * pixelColor.y;
+                pixelColor.z = alpha * rgb.z + oneMinusAlpha * pixelColor.z;
+                pixelColor.w = alpha + pixelColor.w;
+            }
+        }
+
+        // Do not overwrite shared memory for the next batch until every
+        // thread in the block is finished consuming the current batch.
+        __syncthreads();
+    }
+
+    if (pixelIsInImage) {
+        *(float4*)(&cuConstRendererParams.imageData[pixelOffset]) = pixelColor;
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -636,10 +862,13 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
 
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    // One CUDA block owns one 16x16 tile.  Each thread owns one pixel within
+    // that tile, while all threads reuse the same batches of circle data.
+    dim3 blockDim(RENDER_TILE_WIDTH, RENDER_TILE_HEIGHT, 1);
+    dim3 gridDim(
+        (image->width + blockDim.x - 1) / blockDim.x,
+        (image->height + blockDim.y - 1) / blockDim.y);
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    kernelRenderPixelsTiled<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
 }
